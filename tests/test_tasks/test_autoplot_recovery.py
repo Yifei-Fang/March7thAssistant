@@ -13,12 +13,16 @@ pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="自动对话仅
 @pytest.fixture
 def plot(qapp, monkeypatch):
     import tasks.tool.autoplot._engine as module
+    from tasks.tool.autoplot._dialog_policy import DialogSignals
 
     foreground = Mock(return_value=SimpleNamespace(title="test-game"))
     monkeypatch.setattr(module, "gw", SimpleNamespace(getActiveWindow=foreground))
     detector = Mock()
     detector.is_dialog_scene.return_value = True
     detector.detect_skip_button.return_value = False
+    detector.is_auto_battle_off.return_value = False
+    detector.is_click_blocked_screen.return_value = False
+    detector.observe_dialog.return_value = DialogSignals(continue_visible=True, dialog_chrome=True)
     monkeypatch.setattr(module, "SceneDetector", detector)
     automation = Mock()
     automation.click_element.return_value = False
@@ -57,7 +61,10 @@ def test_idle_polling_resumes_when_game_appears(plot, monkeypatch):
 
 
 def test_dialog_exception_recovers_without_toggling_switch(plot):
-    plot.detector.detect_skip_button.side_effect = [RuntimeError("临时截图失败"), False]
+    from tasks.tool.autoplot._dialog_policy import DialogSignals
+
+    standing = DialogSignals(continue_visible=True, dialog_chrome=True)
+    plot.detector.observe_dialog.side_effect = [RuntimeError("临时截图失败"), standing]
     plot.engine._monitor_loop()
     old_session = plot.engine._dialog_session
     plot.pending.pop(0)()
@@ -68,7 +75,7 @@ def test_dialog_exception_recovers_without_toggling_switch(plot):
 
     plot.engine._monitor_loop()
     plot.pending.pop(0)()
-    assert plot.detector.detect_skip_button.call_count == 2
+    assert plot.detector.observe_dialog.call_count == 2
     assert len(plot.pending) == 1
 
 
@@ -77,8 +84,11 @@ def test_qt_timer_recovers_after_dialog_exception(plot, qtbot, monkeypatch):
     monkeypatch.setattr(plot.module.QTimer, "singleShot", plot.single_shot)
     monkeypatch.setattr(plot.module.Threshold, "DIALOG_LOOP_INITIAL_DELAY", 0)
     plot.engine._monitor_timer.setInterval(10)
-    plot.detector.detect_skip_button.side_effect = [RuntimeError("临时截图失败"), False]
-    qtbot.waitUntil(lambda: plot.detector.detect_skip_button.call_count == 2)
+    from tasks.tool.autoplot._dialog_policy import DialogSignals
+
+    standing = DialogSignals(continue_visible=True, dialog_chrome=True)
+    plot.detector.observe_dialog.side_effect = [RuntimeError("临时截图失败"), standing]
+    qtbot.waitUntil(lambda: plot.detector.observe_dialog.call_count == 2)
     assert plot.engine.is_running
     assert plot.engine._monitor_timer.isActive()
     plot.automation.click_element.assert_called_once()
@@ -110,16 +120,16 @@ def test_pending_dialog_is_cancelled_when_game_loses_focus(plot):
     stale_callback = plot.pending.pop(0)
     plot.foreground.return_value = None
     stale_callback()
-    plot.detector.detect_skip_button.assert_not_called()
+    plot.detector.observe_dialog.assert_not_called()
     assert plot.engine._state == plot.module.EngineState.MONITORING
 
     # 游戏重新出现时旧会话仍不能执行，新会话正常启动。
     plot.foreground.return_value = SimpleNamespace(title="test-game")
     plot.engine._monitor_loop()
     stale_callback()
-    plot.detector.detect_skip_button.assert_not_called()
+    plot.detector.observe_dialog.assert_not_called()
     plot.pending.pop(0)()
-    plot.detector.detect_skip_button.assert_called_once()
+    plot.detector.observe_dialog.assert_called_once()
 
 
 def test_pending_dialog_is_cancelled_after_stop(plot):
@@ -127,7 +137,7 @@ def test_pending_dialog_is_cancelled_after_stop(plot):
     callback = plot.pending.pop(0)
     plot.engine.stop()
     callback()
-    plot.detector.detect_skip_button.assert_not_called()
+    plot.detector.observe_dialog.assert_not_called()
     assert not plot.pending
 
 
@@ -159,7 +169,7 @@ def test_screenshot_failure_in_timer_never_sleeps(plot, monkeypatch, stage):
         plot.engine._monitor_loop()
     else:
         plot.engine._monitor_loop()
-        plot.detector.detect_skip_button.side_effect = lambda: automation.take_screenshot()
+        plot.detector.observe_dialog.side_effect = lambda: automation.take_screenshot()
         plot.pending.pop(0)()
     capture.assert_called_once()
     sleep.assert_not_called()

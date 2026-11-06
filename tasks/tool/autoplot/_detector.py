@@ -11,9 +11,17 @@ import time
 from typing import Optional
 
 from module.automation import auto
-from module.logger import log
 
 from ._config import Crop, Img, Threshold
+from ._dialog_policy import (
+    CHOICE_KIND_EXIT,
+    CHOICE_KIND_MESSAGE,
+    CHOICE_KIND_PREV_PAGE,
+    CHOICE_KIND_SELECT,
+    ChoiceMark,
+    DialogSignals,
+    mark_from_match,
+)
 
 
 class SceneDetector:
@@ -124,44 +132,92 @@ class SceneDetector:
         )
 
     # ========================================================================
-    # 对话选项检测
+    # 对话层观察（只识别，不点击）
     # ========================================================================
 
     @staticmethod
-    def has_dialog_options() -> bool:
-        """检查当前画面是否存在对话选项（如分支选择）。
+    def observe_dialog() -> DialogSignals:
+        """采集当前画面对话层信号。
 
-        在对话选项区域依次匹配 select / message / exit / prev-page 图标。
-
-        返回:
-            True  存在至少一个对话选项
-            False 不存在任何对话选项
+        本方法不点击。选项图标在宽检测带里一次取全，供策略判断是不是单列。
         """
-        auto.take_screenshot(crop=Crop.DIALOG_OPTIONS)
-        for img_path in Img.DIALOG_OPTIONS:
-            if auto.find_element(img_path, "image", Threshold.DIALOG_OPTION_MATCH, take_screenshot=False):
-                return True
-        return False
+        auto.take_screenshot()
+        dialog_chrome = _seen_any(Img.START, Threshold.START_MATCH) or _seen(Img.HIDE, Threshold.HIDE_MATCH)
+        continue_visible = _seen(Img.CONTINUE, Threshold.CONTINUE_MATCH)
+        confirm_visible = _seen(Img.CONFIRM, Threshold.CONFIRM_MATCH)
+        teleport_visible = _seen_any(Img.TELEPORT, Threshold.STOP_UI_MATCH)
+        party_setup_visible = _seen_any(Img.PARTY_SETUP, Threshold.STOP_UI_MATCH)
+        challenge_start_visible = _seen_any(Img.CHALLENGE_START, Threshold.STOP_UI_MATCH)
+        system_ui_visible = _seen_any(Img.SYSTEM_UI, Threshold.STOP_UI_MATCH)
+        phone_visible = _seen(Img.CLOSE_PHONE, Threshold.CLOSE_PHONE_MATCH) or _seen_any(
+            Img.PHONE_UI, Threshold.STOP_UI_MATCH,
+        )
+        combat_visible = _seen_any(Img.COMBAT_CHROME, Threshold.STOP_UI_MATCH)
+
+        auto.take_screenshot(crop=Crop.CHOICE_BAND)
+        marks: list[ChoiceMark] = []
+        for kind, image in (
+            (CHOICE_KIND_SELECT, Img.SELECT),
+            (CHOICE_KIND_EXIT, Img.EXIT),
+            (CHOICE_KIND_MESSAGE, Img.MESSAGE),
+            (CHOICE_KIND_PREV_PAGE, Img.PREV_PAGE),
+        ):
+            marks.extend(_choice_marks(kind, image))
+
+        investigate_visible = bool(auto.find_element(
+            Img.INVESTIGATE, "image", Threshold.INVESTIGATE_MATCH, crop=Crop.INVESTIGATE,
+        ))
+        skip_visible = bool(auto.find_element(
+            Img.SKIP_MODEL, "yolo", Threshold.SKIP_YOLO, crop=Crop.SKIP_BUTTON,
+        ))
+        phone_visible = phone_visible or auto.is_rgb_ratio_above_threshold(
+            Crop.PHONE_MSG, Threshold.PHONE_RGB,
+            Threshold.PHONE_RGB_RATIO, tolerance=Threshold.RGB_TOLERANCE,
+        ) or auto.is_rgb_ratio_above_threshold(
+            Crop.PHONE_MSG2, Threshold.PHONE_RGB,
+            Threshold.PHONE2_RGB_RATIO, tolerance=Threshold.RGB_TOLERANCE,
+        )
+        combat_visible = combat_visible or SceneDetector.is_auto_battle_off()
+
+        return DialogSignals(
+            skip_visible=skip_visible,
+            dialog_chrome=dialog_chrome,
+            continue_visible=continue_visible,
+            marks=tuple(marks),
+            confirm_visible=confirm_visible,
+            teleport_visible=teleport_visible,
+            phone_visible=phone_visible,
+            combat_visible=combat_visible,
+            party_setup_visible=party_setup_visible,
+            challenge_start_visible=challenge_start_visible,
+            investigate_visible=investigate_visible,
+            system_ui_visible=system_ui_visible,
+        )
 
     @staticmethod
-    def click_dialog_option() -> bool:
-        """点击对话选项区域（优先 SELECT，不存在则尝试 EXIT）。
+    def click_choice(mark: ChoiceMark) -> bool:
+        """点击策略已经选定的那一个选项图标。没有坐标时不点击。"""
+        if mark.kind != CHOICE_KIND_SELECT or not mark.box:
+            return False
+        return bool(auto.click_element_with_pos(mark.box))
 
-        返回:
-            True  找到并点击了选项
-            False 未找到选项
-        """
-        # 先尝试点击 SELECT
-        if auto.click_element(
-            Img.SELECT, "image", Threshold.SELECT_MATCH,
-            crop=Crop.DIALOG_OPTIONS,
-        ):
+    @staticmethod
+    def is_click_blocked_screen() -> bool:
+        """非对话画面里，这些界面不允许自动点关闭或短信。"""
+        auto.take_screenshot()
+        if _seen_any(Img.COMBAT_CHROME, Threshold.STOP_UI_MATCH):
             return True
-        # 若未找到，再尝试点击 EXIT
-        return auto.click_element(
-            Img.EXIT, "image", Threshold.SELECT_MATCH,
-            crop=Crop.DIALOG_OPTIONS,
-        )
+        if _seen_any(Img.PARTY_SETUP, Threshold.STOP_UI_MATCH):
+            return True
+        if _seen_any(Img.CHALLENGE_START, Threshold.STOP_UI_MATCH):
+            return True
+        if _seen_any(Img.TELEPORT, Threshold.STOP_UI_MATCH):
+            return True
+        if _seen(Img.CONFIRM, Threshold.CONFIRM_MATCH):
+            return True
+        return bool(auto.find_element(
+            Img.INVESTIGATE, "image", Threshold.INVESTIGATE_MATCH, crop=Crop.INVESTIGATE,
+        ))
 
     # ========================================================================
     # 自动战斗检测
@@ -242,3 +298,31 @@ class SceneDetector:
     def move_mouse_to_click_pos() -> None:
         """将鼠标移动到默认点击位置（底部中央），避免干扰后续匹配。"""
         auto.click_element(Crop.CLICK_POS, "crop", action="move")
+
+
+def _seen(image: str, threshold: float) -> bool:
+    return bool(auto.find_element(image, "image", threshold, take_screenshot=False))
+
+
+def _seen_any(images: tuple[str, ...], threshold: float) -> bool:
+    return any(_seen(image, threshold) for image in images)
+
+
+def _choice_marks(kind: str, image: str) -> list[ChoiceMark]:
+    found = auto.find_element(
+        image,
+        "image_with_multiple_targets",
+        Threshold.CHOICE_MARK_MATCH,
+        take_screenshot=False,
+        relative=True,
+    )
+    if not found:
+        return []
+
+    width, height = auto.screenshot.size
+    pos = auto.screenshot_pos
+    scale = auto.screenshot_scale_factor or 1
+    return [
+        mark_from_match(kind, Crop.CHOICE_BAND, (width, height), top_left, bottom_right, pos, scale)
+        for top_left, bottom_right in found
+    ]
