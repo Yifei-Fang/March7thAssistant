@@ -20,6 +20,7 @@ class EngineState(Enum):
     MONITORING = "monitoring"           # 监控中，等待进入对话场景
     DIALOG_ACTIVE = "dialog_active"     # 对话中，正在执行点击循环
     WAITING_OPTION = "waiting_option"   # 暂停点击，等待用户手动选择对话选项
+    HOLDING = "holding"                 # 识别到不可自动点击的界面，停止点击并等待恢复
 
 
 # ============================================================================
@@ -50,10 +51,16 @@ class Crop:
         1801.0 / 1920, 47.0 / 1080, 36.0 / 1920, 25.0 / 1080,
     )
 
-    # 右侧：对话选项区域
+    # 右侧：对话选项区域（历史窄列，保留给单列图标的参考范围）
     DIALOG_OPTIONS: tuple[float, float, float, float] = (
         1290.0 / 1920, 442.0 / 1080, 74.0 / 1920, 400.0 / 1080,
     )
+
+    # 选项图标的宽检测带：要能同时看到左右两列，才能拒绝不稳定布局
+    CHOICE_BAND: tuple[float, float, float, float] = (0.15, 0.20, 0.80, 0.72)
+
+    # 世界交互提示（F）常见位置。只在这块区域里认，减少把字母误认成交互键。
+    INVESTIGATE: tuple[float, float, float, float] = (0.35, 0.40, 0.30, 0.25)
 
     # --- 跳过按钮 ---
     # 右上角：跳过按钮 YOLO 检测区域
@@ -142,8 +149,39 @@ class Img:
     # 通用关闭按钮
     CLICK_CLOSE: str = "./assets/images/zh_CN/base/click_close.png"
 
-    # 确认按钮
+    # 确认按钮。只在“刚刚点过跳过”之后作为跳过确认使用，不能当成选项第一项。
     CONFIRM: str = "./assets/images/zh_CN/base/confirm.png"
+
+    # 以下模板只用于停止点击，不作为点击目标。
+    PARTY_SETUP: tuple[str, ...] = (
+        "./assets/images/screen/configure_team.png",
+        "./assets/images/share/menu/configure_team.png",
+    )
+    TELEPORT: tuple[str, ...] = (
+        "./assets/images/share/power/space_anchor/SpaceAnchor1.png",
+        "./assets/images/share/power/space_anchor/SpaceAnchor2.png",
+    )
+    INVESTIGATE: str = "./assets/images/share/base/F.png"
+    COMBAT_CHROME: tuple[str, ...] = (
+        "./assets/images/zh_CN/fight/fight_exit.png",
+        "./assets/images/zh_CN/fight/fight_again.png",
+        "./assets/images/zh_CN/fight/fight_fail.png",
+        "./assets/images/forgottenhall/prepare_fight.png",
+    )
+    CHALLENGE_START: tuple[str, ...] = (
+        "./assets/images/purefiction/start.png",
+        "./assets/images/purefiction/start_story.png",
+        "./assets/images/zh_CN/warp/start_trial.png",
+        "./assets/images/screen/divergent_universe/start.png",
+    )
+    PHONE_UI: tuple[str, ...] = (
+        "./assets/images/screen/message.png",
+        "./assets/images/screen/incoming_message.png",
+    )
+    SYSTEM_UI: tuple[str, ...] = (
+        "./assets/images/zh_CN/base/click_close.png",
+        "./assets/images/zh_CN/base/use.png",
+    )
 
 
 # ============================================================================
@@ -159,6 +197,9 @@ class Threshold:
     HIDE_MATCH: float = 0.8           # hide 按钮
     SELECT_MATCH: float = 0.9         # 对话选项
     DIALOG_OPTION_MATCH: float = 0.8  # 对话选项（检测是否存在）
+    CHOICE_MARK_MATCH: float = 0.9    # 选项图标（用于判断列数，阈值过低会把噪声当成第二列）
+    STOP_UI_MATCH: float = 0.9        # 必须停下的系统界面
+    INVESTIGATE_MATCH: float = 0.92   # 交互键 F，略高于普通模板，减少误停
     SKIP_YOLO: float = 0.25           # 跳过按钮 YOLO 阈值
     NOT_AUTO_MATCH: float = 0.8       # 未自动战斗图标
     CLOSE_PHONE_MATCH: float = 0.9    # 关闭手机按钮

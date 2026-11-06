@@ -5,12 +5,14 @@ AutoPlot 是整个自动对话功能的主控制器，负责：
 - 管理运行状态与生命周期（启动 / 停止 / 配置更新）
 - 通过定时器轮询游戏窗口状态
 - 协调场景检测与点击执行
-- 核心策略：检测 continue 箭头，出现即代表对话文本已展示完毕，点击推进
+- 核心策略：可跳过的站立对话点跳过；只有单列选项时点第一项；
+  其余界面停止点击并记下界面类型，等对话或探索画面回来再继续
 
 架构说明：
     AutoPlot (QObject)          ← 主控制器，持有 QTimer
-        ├── SceneDetector       ← 静态方法，场景识别
-        └── _dialog_loop()      ← 对话点击循环（检测 Continue + 跳过 + 选项）
+        ├── SceneDetector       ← 静态方法，场景识别（只观察，不决定点哪里）
+        ├── decide_dialog_action ← 对话层策略
+        └── _dialog_loop()      ← 按策略执行跳过 / 第一项 / 继续，或停止
 
 会话隔离机制：
     使用递增的 _dialog_session 计数器来取消过期的延迟回调。
@@ -44,6 +46,21 @@ from ._config import (
     Defaults,
 )
 from ._detector import SceneDetector
+from ._dialog_policy import (
+    CHOICE_KIND_SELECT,
+    DialogAction,
+    DialogDecision,
+    DialogSignals,
+    DialogUiType,
+    decide_dialog_action,
+)
+
+# 对话循环仍在跑的状态。HOLDING 表示已经停止点击，但还在等界面恢复。
+_DIALOG_CYCLE = (
+    EngineState.DIALOG_ACTIVE,
+    EngineState.WAITING_OPTION,
+    EngineState.HOLDING,
+)
 
 # 引擎在图形界面线程上执行点击：后台模式下鼠标正被使用或窗口暂时不可用时只短暂等待，交给下一轮监控，不阻塞界面。
 GUI_INPUT_WAIT_LIMIT = 0.3
@@ -92,6 +109,8 @@ class AutoPlot(QObject):
         self._last_auto_battle_check: float = 0.0
         """上次检测自动战斗的时间戳（monotonic 秒）"""
         self._last_error_log_time = float('-inf')
+        self._held_notice: tuple | None = None
+        """最近一次停止点击日志对应的 (界面类型, 动作)。相同则不重复记录。"""
 
         # --- 可配置选项（有默认值，可通过 update_options 覆盖）---
         self.auto_skip: bool = Defaults.AUTO_SKIP
@@ -121,6 +140,7 @@ class AutoPlot(QObject):
         auto._init_input()
         self.is_running = True
         self._last_error_log_time = float('-inf')
+        self._held_notice = None
         if self._hero_reader is not None:
             self._hero_reader.reset()
         self._transition_to(EngineState.MONITORING)
@@ -140,6 +160,7 @@ class AutoPlot(QObject):
         self.is_running = False
         self._monitor_timer.stop()
         self._invalidate_session()
+        self._held_notice = None
         self._transition_to(EngineState.IDLE)
         auto.input_handler.release_all()
         log.info("自动对话已停止")
@@ -196,11 +217,11 @@ class AutoPlot(QObject):
     def _is_session_valid(self, session: int) -> bool:
         """检查给定的 session 是否仍然有效。
 
-        对话活跃状态包括 DIALOG_ACTIVE 和 WAITING_OPTION（暂停等待用户选择）。
+        对话循环状态包括正在点击、等待用户选择，以及因界面不安全而停止点击。
         """
         return (
             self.is_running
-            and self._state in (EngineState.DIALOG_ACTIVE, EngineState.WAITING_OPTION)
+            and self._state in _DIALOG_CYCLE
             and session == self._dialog_session
         )
 
@@ -208,6 +229,7 @@ class AutoPlot(QObject):
         """取消中断的点击会话，由下一轮监控重新检测，避免假运行状态。"""
         if not self.is_running:
             return
+        self._held_notice = None
         self._invalidate_session()
         self._transition_to(EngineState.MONITORING)
         try:
@@ -308,7 +330,7 @@ class AutoPlot(QObject):
         # 1. 窗口激活检查
         window_active = self._is_game_window_active()
         if not window_active:
-            if self._state in (EngineState.DIALOG_ACTIVE, EngineState.WAITING_OPTION):
+            if self._state in _DIALOG_CYCLE:
                 self._invalidate_session()
                 self._transition_to(EngineState.MONITORING)
             return
@@ -324,8 +346,8 @@ class AutoPlot(QObject):
 
         # 2. 对话场景检测 → 启动或停止对话循环
         if SceneDetector.is_dialog_scene():
-            # 仅在尚未进入对话状态时启动新的对话循环
-            if self._state not in (EngineState.DIALOG_ACTIVE, EngineState.WAITING_OPTION):
+            # 仅在尚未进入对话状态时启动新的对话循环。HOLDING 也算对话循环仍在跑。
+            if self._state not in _DIALOG_CYCLE:
                 self._transition_to(EngineState.DIALOG_ACTIVE)
                 session = self._invalidate_session()
                 self._schedule(
@@ -334,10 +356,9 @@ class AutoPlot(QObject):
                     session,
                 )
         else:
-            # 非对话场景：如果之前在对话中（包括等待选项），则退出
-            if self._state in (EngineState.DIALOG_ACTIVE, EngineState.WAITING_OPTION):
-                self._invalidate_session()
-                self._transition_to(EngineState.MONITORING)
+            # 非对话场景：如果之前在对话中（包括等待选项或已停止点击），则退出
+            if self._state in _DIALOG_CYCLE:
+                self._end_dialog_cycle(explore=True)
 
             # 3. 非对话场景下的辅助操作
             self._handle_non_dialog_actions()
@@ -354,13 +375,18 @@ class AutoPlot(QObject):
         2. 手机对话页面检测与关闭
         3. 通用关闭按钮
         """
-        # 1. 自动战斗检测（带 10 秒冷却）
-        if self.auto_battle_detect_enable and SceneDetector.is_auto_battle_off():
+        # 1. 自动战斗检测（带 10 秒冷却）。只按已有的自动战斗热键，不点战斗界面。
+        auto_battle_off = SceneDetector.is_auto_battle_off()
+        if self.auto_battle_detect_enable and auto_battle_off:
             now = time.monotonic()
             if now - self._last_auto_battle_check >= Threshold.AUTO_BATTLE_COOLDOWN:
                 log.info("尝试开启自动战斗")
                 auto.press_key(cfg.get_value("hotkey_auto_battle", "v"))
                 self._last_auto_battle_check = now
+
+        # 战斗、传送确认、编队、挑战和调查界面不再点短信或关闭，避免把第一项点成取消。
+        if auto_battle_off or SceneDetector.is_click_blocked_screen():
+            return
 
         # 2. 手机对话页面（可通过开关控制）
         if self.auto_phone_detect_enable:
@@ -374,58 +400,112 @@ class AutoPlot(QObject):
     # ========================================================================
 
     def _dialog_loop(self, session: int) -> None:
-        """对话点击循环：检测 continue 箭头并点击推进对话。
+        """按对话层策略执行一轮动作。
 
-        核心逻辑：
-            Img.CONTINUE（continue 箭头）出现 = 对话文本已展示完毕，
-            点击该位置即可推进到下一段对话。
-
-        执行顺序：
-        1. 若 auto_click 关闭且存在对话选项 → 暂停等待用户选择
-        2. 若 auto_skip 开启 → 检测并点击跳过按钮
-        3. 点击对话选项（如有）
-        4. 检测 continue 箭头 → 点击推进（核心步骤）
-        5. 调度下一次循环
+        1. 可跳过的站立对话 → 点跳过（本轮点中之后才点跳过确认）
+        2. 只有单列 select 选项 → 点最靠上的一项
+        3. 普通对话的继续箭头 → 点继续
+        4. 其余界面停止点击，日志写明 ui_type，下一轮重新识别
         """
         if not self._is_session_valid(session):
             return
 
-        # --- 1. 对话选项检测 ---
-        # 若用户选择不自动选择对话选项，则检测到选项时暂停
-        if not self.auto_click:
-            if SceneDetector.has_dialog_options():
-                log.debug("根据设置，暂停点击以等待用户选择对话选项")
-                self._transition_to(EngineState.WAITING_OPTION)
-                self._schedule(Threshold.MONITOR_INTERVAL, self._dialog_loop, session)
-                return
-            # 恢复为对话活跃状态（可能在之前被设为 WAITING_OPTION）
-            if self._state == EngineState.WAITING_OPTION:
-                self._transition_to(EngineState.DIALOG_ACTIVE)
+        signals = SceneDetector.observe_dialog()
+        if not isinstance(signals, DialogSignals):
+            raise RuntimeError(f"对话观察结果无效：{type(signals).__name__}")
+        decision = decide_dialog_action(
+            signals,
+            auto_skip=self.auto_skip,
+            auto_click=self.auto_click,
+        )
+        self._apply_dialog_decision(decision, session)
 
-        # --- 2. 跳过按钮检测 ---
-        if self.auto_skip and SceneDetector.detect_skip_button():
-            # 跳过成功后会弹出确认框，尝试点击确认
-            if not SceneDetector.click_confirm():
-                # 确认点击失败，移动鼠标避免干扰下次匹配
-                SceneDetector.move_mouse_to_click_pos()
+    def _apply_dialog_decision(self, decision: DialogDecision, session: int) -> None:
+        action = decision.action
+
+        if action is DialogAction.CLICK_SKIP:
+            self._release_hold(decision)
+            self._transition_to(EngineState.DIALOG_ACTIVE)
+            # 跳过确认只跟在这一次成功的跳过点击后面，不能留到下一轮去点第一项。
+            if SceneDetector.detect_skip_button():
+                if not SceneDetector.click_confirm():
+                    SceneDetector.move_mouse_to_click_pos()
             self._schedule(Threshold.MONITOR_INTERVAL, self._dialog_loop, session)
             return
 
-        # --- 3. 点击对话选项推进（优先 SELECT，不存在则尝试 EXIT）---
-        SceneDetector.click_dialog_option()
+        if action is DialogAction.CLICK_FIRST_OPTION:
+            mark = decision.first_option
+            if mark is None or mark.kind != CHOICE_KIND_SELECT or not mark.box:
+                self._hold(DialogDecision(DialogAction.STOP, DialogUiType.NONSTANDARD_CHOICE))
+                self._schedule(Threshold.MONITOR_INTERVAL, self._dialog_loop, session)
+                return
+            self._release_hold(decision)
+            self._transition_to(EngineState.DIALOG_ACTIVE)
+            SceneDetector.click_choice(mark)
+            log.debug("自动对话选择首个选项 ui_type=single_column_choice action=click_first_option")
+            self._schedule(Threshold.DIALOG_LOOP_INTERVAL, self._dialog_loop, session)
+            return
 
-        # --- 4. 核心：检测 continue 箭头并点击推进 ---
-        # continue 箭头出现代表文本已展示完毕，点击推进到下一段
+        if action is DialogAction.CLICK_CONTINUE:
+            self._release_hold(decision)
+            self._transition_to(EngineState.DIALOG_ACTIVE)
+            self._click_continue()
+            self._schedule(Threshold.DIALOG_LOOP_INTERVAL, self._dialog_loop, session)
+            return
+
+        if action is DialogAction.WAIT and decision.ui_type is DialogUiType.SINGLE_COLUMN_CHOICE:
+            self._release_hold(decision)
+            if self._state != EngineState.WAITING_OPTION:
+                log.debug("根据设置，暂停点击以等待用户选择对话选项")
+                self._transition_to(EngineState.WAITING_OPTION)
+            self._schedule(Threshold.MONITOR_INTERVAL, self._dialog_loop, session)
+            return
+
+        if action is DialogAction.WAIT and decision.ui_type is DialogUiType.DIALOG_TEXT_PENDING:
+            self._release_hold(decision)
+            self._transition_to(EngineState.DIALOG_ACTIVE)
+            self._schedule(Threshold.DIALOG_LOOP_INTERVAL, self._dialog_loop, session)
+            return
+
+        self._hold(decision)
+        self._schedule(Threshold.MONITOR_INTERVAL, self._dialog_loop, session)
+
+    def _click_continue(self) -> None:
+        """点击 continue 箭头推进已经展示完的对话文本。"""
         if auto.click_element(
             Img.CONTINUE, "image", Threshold.CONTINUE_MATCH,
             crop=Crop.DIALOG_CONTINUE,
-            action="down"
+            action="down",
         ):
-            # 短暂延迟确保游戏接收到按下事件
             time.sleep(0.2)
-            # 鼠标释放
             auto.mouse_up()
             log.debug("检测到 continue 箭头，点击推进对话")
 
-        # --- 5. 调度下一次循环 ---
-        self._schedule(Threshold.DIALOG_LOOP_INTERVAL, self._dialog_loop, session)
+    def _hold(self, decision: DialogDecision) -> None:
+        """停止点击。同一种界面只记录一次，界面变化后再次记录。"""
+        self._transition_to(EngineState.HOLDING)
+        notice = (decision.ui_type, decision.action)
+        if notice == self._held_notice:
+            return
+        self._held_notice = notice
+        log.warning(
+            f"自动对话停止点击 ui_type={decision.ui_type.value} action={decision.action.value}"
+        )
+
+    def _release_hold(self, decision: DialogDecision | None = None, *, explore: bool = False) -> None:
+        """界面恢复到可以继续处理的状态。"""
+        if self._held_notice is None:
+            return
+        if explore:
+            log.info("自动对话解除停止 ui_type=explore action=resume")
+        elif decision is not None:
+            log.info(
+                f"自动对话解除停止 ui_type={decision.ui_type.value} action={decision.action.value}"
+            )
+        self._held_notice = None
+
+    def _end_dialog_cycle(self, *, explore: bool) -> None:
+        if explore:
+            self._release_hold(explore=True)
+        self._invalidate_session()
+        self._transition_to(EngineState.MONITORING)
